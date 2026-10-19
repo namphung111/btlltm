@@ -5,10 +5,10 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.net.Socket;
+import java.sql.SQLException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 public class ClientHandler implements Runnable {
     private final ChatServer server;
@@ -74,25 +74,34 @@ public class ClientHandler implements Runnable {
         @SuppressWarnings("unchecked")
         Map<String, Object> map = (Map<String, Object>) request;
         String action = String.valueOf(map.get("action"));
-        switch (action) {
-            case "register" -> handleRegister(map);
-            case "login" -> handleLogin(map);
-            case "logout" -> handleLogout();
-            case "listUsers" -> handleListUsers();
-            case "createRoom" -> handleCreateRoom(map);
-            case "joinRoom" -> handleJoinRoom(map);
-            case "sendMessage" -> handleSendMessage(map);
-            case "sendFile" -> handleSendFile(map);
-            case "getHistory" -> handleGetHistory(map);
-            default -> sendError("Unsupported action: " + action);
+        try {
+            switch (action) {
+                case "register" -> handleRegister(map);
+                case "login" -> handleLogin(map);
+                case "logout" -> handleLogout();
+                case "listUsers" -> handleListUsers();
+                case "createRoom" -> handleCreateRoom(map);
+                case "joinRoom" -> handleJoinRoom(map);
+                case "sendMessage" -> handleSendMessage(map);
+                case "sendFile" -> handleSendFile(map);
+                case "getHistory" -> handleGetHistory(map);
+                default -> sendError("Unsupported action: " + action);
+            }
+        } catch (SQLException e) {
+            System.err.println("Database operation failed for action " + action + ": " + e.getMessage());
+            sendError("Database operation failed. Check the server database connection and logs.");
         }
     }
 
-    private void handleRegister(Map<?, ?> request) {
-        String username = String.valueOf(request.get("username"));
-        String password = String.valueOf(request.get("password"));
+    private void handleRegister(Map<?, ?> request) throws SQLException {
+        String username = request.get("username") instanceof String value ? value : "";
+        String password = request.get("password") instanceof String value ? value : "";
         Map<String, Object> response = new HashMap<>();
-        if (username == null || username.isBlank() || password == null || password.isBlank()) {
+        if (this.username != null) {
+            sendError("Please logout before registering another account");
+            return;
+        }
+        if (username.isBlank() || password.isBlank()) {
             response.put("status", "error");
             response.put("message", "Username and password are required");
             send(response);
@@ -106,13 +115,17 @@ public class ClientHandler implements Runnable {
     }
 
     private void handleLogin(Map<?, ?> request) {
-        String username = String.valueOf(request.get("username"));
-        String password = String.valueOf(request.get("password"));
+        String requestedUsername = request.get("username") instanceof String value ? value : "";
+        String password = request.get("password") instanceof String value ? value : "";
         Map<String, Object> response = new HashMap<>();
-        if (server.login(username, password, this)) {
+        if (username != null) {
+            sendError("Please logout before changing accounts");
+            return;
+        }
+        if (server.login(requestedUsername, password, this)) {
             response.put("status", "success");
             response.put("message", "Login successful");
-            response.put("username", username);
+            response.put("username", getUsername());
             response.put("onlineUsers", server.getOnlineUsers());
             send(response);
             server.broadcastOnlineUsers();
@@ -126,6 +139,7 @@ public class ClientHandler implements Runnable {
     private void handleLogout() {
         server.logout(this);
         Map<String, Object> response = new HashMap<>();
+        response.put("action", "logout");
         response.put("status", "success");
         response.put("message", "Logged out");
         send(response);
@@ -140,7 +154,7 @@ public class ClientHandler implements Runnable {
         send(response);
     }
 
-    private void handleCreateRoom(Map<?, ?> request) {
+    private void handleCreateRoom(Map<?, ?> request) throws SQLException {
         @SuppressWarnings("unchecked")
         Map<String, Object> map = (Map<String, Object>) request;
         if (username == null) {
@@ -166,7 +180,7 @@ public class ClientHandler implements Runnable {
         send(response);
     }
 
-    private void handleJoinRoom(Map<?, ?> request) {
+    private void handleJoinRoom(Map<?, ?> request) throws SQLException {
         if (username == null) {
             sendError("Please login first");
             return;
@@ -187,7 +201,7 @@ public class ClientHandler implements Runnable {
         send(response);
     }
 
-    private void handleSendMessage(Map<?, ?> request) {
+    private void handleSendMessage(Map<?, ?> request) throws SQLException {
         @SuppressWarnings("unchecked")
         Map<String, Object> map = (Map<String, Object>) request;
         if (username == null) {
@@ -197,7 +211,7 @@ public class ClientHandler implements Runnable {
         String roomId = String.valueOf(map.get("roomId"));
         String content = String.valueOf(map.getOrDefault("content", ""));
         ChatMessage message = new ChatMessage(roomId, username, content);
-        boolean sent = server.sendMessage(roomId, message);
+        boolean sent = server.sendMessage(roomId, message, this);
 
         Map<String, Object> response = new HashMap<>();
         response.put("status", sent ? "success" : "error");
@@ -205,16 +219,20 @@ public class ClientHandler implements Runnable {
         send(response);
     }
 
-    private void handleSendFile(Map<?, ?> request) {
+    private void handleSendFile(Map<?, ?> request) throws SQLException {
         if (username == null) {
             sendError("Please login first");
             return;
         }
         String roomId = String.valueOf(request.get("roomId"));
         String fileName = String.valueOf(request.get("fileName"));
-        byte[] fileData = (byte[]) request.get("fileData");
+        Object requestedFileData = request.get("fileData");
+        if (!(requestedFileData instanceof byte[] fileData) || fileData.length > 5 * 1024 * 1024) {
+            sendError("File must be a byte array no larger than 5 MB");
+            return;
+        }
         ChatMessage message = new ChatMessage(roomId, username, "[FILE] " + fileName, fileName, fileData);
-        boolean sent = server.sendMessage(roomId, message);
+        boolean sent = server.sendMessage(roomId, message, this);
 
         Map<String, Object> response = new HashMap<>();
         response.put("status", sent ? "success" : "error");
@@ -223,7 +241,15 @@ public class ClientHandler implements Runnable {
     }
 
     private void handleGetHistory(Map<?, ?> request) {
-        String roomId = String.valueOf(request.get("roomId"));
+        if (username == null) {
+            sendError("Please login first");
+            return;
+        }
+        String roomId = request.get("roomId") instanceof String value ? value : "";
+        if (!server.isRoomMember(roomId, username)) {
+            sendError("Join the room before loading its history");
+            return;
+        }
         List<ChatMessage> history = server.getHistory(roomId);
         Map<String, Object> response = new HashMap<>();
         response.put("status", "success");

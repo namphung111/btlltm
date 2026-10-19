@@ -18,12 +18,17 @@ public class ChatMessage implements Serializable {
     }
 
     public ChatMessage(String roomId, String sender, String content, String fileName, byte[] fileData) {
+        this(roomId, sender, content, fileName, fileData, Instant.now().toEpochMilli());
+    }
+
+    public ChatMessage(String roomId, String sender, String content, String fileName, byte[] fileData,
+                       long timestamp) {
         this.roomId = roomId;
         this.sender = sender;
         this.content = content;
         this.fileName = fileName;
         this.fileData = fileData;
-        this.timestamp = Instant.now().toEpochMilli();
+        this.timestamp = timestamp;
     }
 
     public String getRoomId() {

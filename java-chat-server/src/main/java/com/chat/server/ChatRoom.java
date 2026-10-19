@@ -38,7 +38,9 @@ public class ChatRoom implements Serializable {
     }
 
     public List<ChatMessage> getHistory() {
-        return history;
+        synchronized (this) {
+            return new ArrayList<>(history);
+        }
     }
 
     public synchronized void addMember(String username) {

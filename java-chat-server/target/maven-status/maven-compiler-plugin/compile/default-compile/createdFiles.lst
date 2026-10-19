@@ -1,0 +1,8 @@
+com\chat\server\ChatRoom.class
+com\chat\server\ClientHandler.class
+com\chat\server\DatabaseStore.class
+com\chat\server\User.class
+com\chat\server\ChatMessage.class
+com\chat\server\ChatClient.class
+com\chat\server\ChatClient$1.class
+com\chat\server\ChatServer.class

@@ -3,6 +3,7 @@ package com.chat.server;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -18,18 +19,25 @@ public class ChatServer {
     private static final String SAMPLE_PASSWORD = "ChatDemo123!";
 
     private final int port;
+    private final DatabaseStore database;
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final Map<String, User> users = new ConcurrentHashMap<>();
-    private final Map<String, ClientHandler> onlineClients = new ConcurrentHashMap<>();
+    private final Map<String, Set<ClientHandler>> onlineClients = new ConcurrentHashMap<>();
     private final Map<String, ChatRoom> rooms = new ConcurrentHashMap<>();
-    private final Map<String, String> clientUserMap = new ConcurrentHashMap<>();
 
-    public ChatServer(int port) {
+    public ChatServer(int port) throws SQLException {
         this.port = port;
+        database = new DatabaseStore();
+        for (User user : database.loadUsers()) {
+            users.put(user.getUsername(), user);
+        }
+        for (ChatRoom room : database.loadRooms()) {
+            rooms.put(room.getRoomId(), room);
+        }
         initializeSampleData();
     }
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws IOException, SQLException {
         int port = Integer.parseInt(System.getProperty("server.port", "9001"));
         ChatServer server = new ChatServer(port);
         server.start();
@@ -47,9 +55,14 @@ public class ChatServer {
         }
     }
 
-    private void initializeSampleData() {
+    private void initializeSampleData() throws SQLException {
         for (String username : List.of("alice", "bob", "charlie")) {
-            users.putIfAbsent(username, new User(username, SAMPLE_PASSWORD));
+            if (!users.containsKey(username)) {
+                User sampleUser = new User(username, SAMPLE_PASSWORD);
+                if (database.insertUser(sampleUser)) {
+                    users.put(username, sampleUser);
+                }
+            }
         }
 
         ChatRoom generalRoom = new ChatRoom("demo-room-general", "Phòng chung", "GROUP");
@@ -62,7 +75,7 @@ public class ChatServer {
                 generalRoom.getRoomId(), "bob", "Mình đã nhận được tin nhắn realtime."));
         generalRoom.addMessage(new ChatMessage(
                 generalRoom.getRoomId(), "charlie", "Có thể gửi tin nhắn mới để thử nhé!"));
-        rooms.putIfAbsent(generalRoom.getRoomId(), generalRoom);
+        addSampleRoomIfMissing(generalRoom, "alice");
 
         ChatRoom teamRoom = new ChatRoom("demo-room-team", "Nhóm bài tập", "GROUP");
         teamRoom.addMember("alice");
@@ -71,7 +84,14 @@ public class ChatServer {
                 teamRoom.getRoomId(), "alice", "Đây là lịch sử mẫu của nhóm bài tập."));
         teamRoom.addMessage(new ChatMessage(
                 teamRoom.getRoomId(), "bob", "Hãy nhập ID phòng này để tham gia: demo-room-team"));
-        rooms.putIfAbsent(teamRoom.getRoomId(), teamRoom);
+        addSampleRoomIfMissing(teamRoom, "alice");
+    }
+
+    private void addSampleRoomIfMissing(ChatRoom room, String owner) throws SQLException {
+        if (!rooms.containsKey(room.getRoomId())) {
+            database.insertRoom(room, owner);
+            rooms.put(room.getRoomId(), room);
+        }
     }
 
     private void handleConnection(Socket clientSocket) {
@@ -88,16 +108,20 @@ public class ChatServer {
         }
     }
 
-    public boolean registerUser(String username, String password) {
+    public boolean registerUser(String username, String password) throws SQLException {
         String normalized = normalizeUsername(username);
-        if (normalized.isEmpty()) {
+        if (normalized.isEmpty() || normalized.length() > 64) {
             return false;
         }
         synchronized (users) {
             if (users.containsKey(normalized)) {
                 return false;
             }
-            users.put(normalized, new User(normalized, password));
+            User user = new User(normalized, password);
+            if (!database.insertUser(user)) {
+                return false;
+            }
+            users.put(normalized, user);
             return true;
         }
     }
@@ -108,11 +132,13 @@ public class ChatServer {
         if (user == null || !user.matchesPassword(password)) {
             return false;
         }
-        synchronized (onlineClients) {
-            onlineClients.put(normalized, clientHandler);
-            clientUserMap.put(clientHandler.toString(), normalized);
+        onlineClients.compute(normalized, (key, sessions) -> {
+            Set<ClientHandler> activeSessions = sessions == null
+                    ? ConcurrentHashMap.newKeySet() : sessions;
+            activeSessions.add(clientHandler);
             user.setOnline(true);
-        }
+            return activeSessions;
+        });
         clientHandler.setUsername(normalized);
         return true;
     }
@@ -120,12 +146,13 @@ public class ChatServer {
     public void logout(ClientHandler clientHandler) {
         String username = clientHandler.getUsername();
         if (username != null) {
-            synchronized (onlineClients) {
-                onlineClients.remove(username);
-            }
+            onlineClients.computeIfPresent(username, (key, sessions) -> {
+                sessions.remove(clientHandler);
+                return sessions.isEmpty() ? null : sessions;
+            });
             User user = users.get(username);
             if (user != null) {
-                user.setOnline(false);
+                user.setOnline(onlineClients.containsKey(username));
             }
         }
         clientHandler.setUsername(null);
@@ -147,13 +174,7 @@ public class ChatServer {
     }
 
     public List<String> getOnlineUsers() {
-        List<String> result = new ArrayList<>();
-        for (String username : users.keySet()) {
-            User user = users.get(username);
-            if (user != null && user.isOnline()) {
-                result.add(username);
-            }
-        }
+        List<String> result = new ArrayList<>(onlineClients.keySet());
         Collections.sort(result);
         return result;
     }
@@ -164,8 +185,8 @@ public class ChatServer {
         return names;
     }
 
-    public String createRoom(String roomName, String type, String owner, List<?> members) {
-        if (roomName == null || roomName.isBlank()) {
+    public String createRoom(String roomName, String type, String owner, List<?> members) throws SQLException {
+        if (roomName == null || roomName.isBlank() || roomName.length() > 100) {
             return null;
         }
         String roomId = UUID.randomUUID().toString();
@@ -178,47 +199,54 @@ public class ChatServer {
                 }
             }
         }
+        database.insertRoom(room, owner);
         rooms.put(roomId, room);
         return roomId;
     }
 
-    public ChatRoom joinRoom(String roomId, String username) {
+    public ChatRoom joinRoom(String roomId, String username) throws SQLException {
         ChatRoom room = rooms.get(roomId);
         if (room == null) {
             return null;
         }
+        database.insertRoomMember(roomId, username);
         room.addMember(username);
         return room;
     }
 
-    public boolean sendMessage(String roomId, ChatMessage message) {
+    public boolean sendMessage(String roomId, ChatMessage message, ClientHandler sender) throws SQLException {
         ChatRoom room = rooms.get(roomId);
         if (room == null || !room.isMember(message.getSender())) {
             return false;
         }
+        database.insertMessage(message);
         room.addMessage(message);
-        broadcastToRoom(roomId, message, message.getSender());
+        broadcastToRoom(roomId, message, sender);
         return true;
+    }
+
+    public boolean isRoomMember(String roomId, String username) {
+        ChatRoom room = rooms.get(roomId);
+        return room != null && room.isMember(username);
     }
 
     public List<ChatMessage> getHistory(String roomId) {
         ChatRoom room = rooms.get(roomId);
-        if (room == null) {
-            return Collections.emptyList();
-        }
-        return new ArrayList<>(room.getHistory());
+        return room == null ? Collections.emptyList() : new ArrayList<>(room.getHistory());
     }
 
     public void broadcastOnlineUsers() {
         Map<String, Object> payload = new HashMap<>();
         payload.put("action", "onlineUsers");
         payload.put("users", getOnlineUsers());
-        for (ClientHandler client : onlineClients.values()) {
-            client.send(payload);
+        for (Set<ClientHandler> sessions : onlineClients.values()) {
+            for (ClientHandler client : sessions) {
+                client.send(payload);
+            }
         }
     }
 
-    public void broadcastToRoom(String roomId, ChatMessage message, String excludedSender) {
+    public void broadcastToRoom(String roomId, ChatMessage message, ClientHandler excludedClient) {
         ChatRoom room = rooms.get(roomId);
         if (room == null) {
             return;
@@ -229,12 +257,13 @@ public class ChatServer {
         payload.put("message", message);
 
         for (String username : room.getMembers()) {
-            if (username.equals(excludedSender)) {
-                continue;
-            }
-            ClientHandler client = onlineClients.get(username);
-            if (client != null) {
-                client.send(payload);
+            Set<ClientHandler> sessions = onlineClients.get(username);
+            if (sessions != null) {
+                for (ClientHandler client : sessions) {
+                    if (client != excludedClient) {
+                        client.send(payload);
+                    }
+                }
             }
         }
     }

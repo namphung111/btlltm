@@ -3,6 +3,7 @@ package com.chat.server;
 import java.io.Serializable;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
 public class User implements Serializable {
@@ -19,8 +20,22 @@ public class User implements Serializable {
         this.lastSeen = System.currentTimeMillis();
     }
 
+    private User(String username, String passwordHash, long lastSeen) {
+        this.username = username;
+        this.passwordHash = passwordHash;
+        this.lastSeen = lastSeen;
+    }
+
+    static User fromStoredHash(String username, String passwordHash) {
+        return new User(username, passwordHash, System.currentTimeMillis());
+    }
+
     public String getUsername() {
         return username;
+    }
+
+    String getPasswordHash() {
+        return passwordHash;
     }
 
     public boolean matchesPassword(String rawPassword) {
@@ -43,7 +58,7 @@ public class User implements Serializable {
     private static String hashPassword(String value) {
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(value.getBytes());
+            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
             return Base64.getEncoder().encodeToString(hash);
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 unavailable", e);
