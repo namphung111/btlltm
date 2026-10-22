@@ -214,14 +214,36 @@ public class ChatServer {
         return room;
     }
 
-    public boolean sendMessage(String roomId, ChatMessage message, ClientHandler sender) throws SQLException {
+    public boolean sendMessage(String roomId, ChatMessage message) throws SQLException {
         ChatRoom room = rooms.get(roomId);
         if (room == null || !room.isMember(message.getSender())) {
             return false;
         }
         database.insertMessage(message);
         room.addMessage(message);
-        broadcastToRoom(roomId, message, sender);
+        broadcastToRoom(roomId, message, null);
+        return true;
+    }
+
+    public boolean markMessageRead(String roomId, long messageId, String reader) throws SQLException {
+        ChatRoom room = rooms.get(roomId);
+        if (room == null || !room.isMember(reader)) {
+            return false;
+        }
+        ChatMessage message = room.getHistory().stream()
+                .filter(candidate -> candidate.getMessageId() == messageId)
+                .findFirst()
+                .orElse(null);
+        if (message == null) {
+            return false;
+        }
+        if (message.getReadBy().contains(reader)) {
+            return true;
+        }
+        for (String username : database.markMessageRead(messageId, roomId, reader)) {
+            message.addReader(username);
+        }
+        broadcastReadReceipt(roomId, message);
         return true;
     }
 
@@ -263,6 +285,22 @@ public class ChatServer {
                     if (client != excludedClient) {
                         client.send(payload);
                     }
+                }
+            }
+        }
+    }
+
+    private void broadcastReadReceipt(String roomId, ChatMessage message) {
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("action", "messageRead");
+        payload.put("roomId", roomId);
+        payload.put("messageId", message.getMessageId());
+        payload.put("readBy", new ArrayList<>(message.getReadBy()));
+        for (String member : rooms.get(roomId).getMembers()) {
+            Set<ClientHandler> sessions = onlineClients.get(member);
+            if (sessions != null) {
+                for (ClientHandler client : sessions) {
+                    client.send(payload);
                 }
             }
         }

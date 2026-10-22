@@ -62,6 +62,22 @@ CREATE TABLE IF NOT EXISTS messages (
         ON DELETE RESTRICT
 ) ENGINE = InnoDB;
 
+CREATE TABLE IF NOT EXISTS message_read_receipts (
+    message_id BIGINT NOT NULL,
+    username VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    read_at BIGINT NOT NULL,
+    PRIMARY KEY (message_id, username),
+    KEY idx_message_read_receipts_username (username),
+    CONSTRAINT fk_message_read_receipts_message
+        FOREIGN KEY (message_id) REFERENCES messages (message_id)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE,
+    CONSTRAINT fk_message_read_receipts_user
+        FOREIGN KEY (username) REFERENCES users (username)
+        ON UPDATE CASCADE
+        ON DELETE CASCADE
+) ENGINE = InnoDB;
+
 INSERT IGNORE INTO users (username, password_hash, created_at) VALUES
     ('alice', 'aQUT/UbklxXjOm1PDIz20Z8du7qUPfog4paPRnUNk2w=', CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS UNSIGNED)),
     ('bob', 'aQUT/UbklxXjOm1PDIz20Z8du7qUPfog4paPRnUNk2w=', CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(3)) * 1000 AS UNSIGNED)),

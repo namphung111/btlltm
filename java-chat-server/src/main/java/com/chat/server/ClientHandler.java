@@ -85,6 +85,7 @@ public class ClientHandler implements Runnable {
                 case "sendMessage" -> handleSendMessage(map);
                 case "sendFile" -> handleSendFile(map);
                 case "getHistory" -> handleGetHistory(map);
+                case "markRead" -> handleMarkRead(map);
                 default -> sendError("Unsupported action: " + action);
             }
         } catch (SQLException e) {
@@ -196,7 +197,7 @@ public class ClientHandler implements Runnable {
         }
 
         response.put("status", "success");
-        response.put("room", room);
+        response.put("roomName", room.getRoomName());
         response.put("roomId", room.getRoomId());
         send(response);
     }
@@ -211,7 +212,7 @@ public class ClientHandler implements Runnable {
         String roomId = String.valueOf(map.get("roomId"));
         String content = String.valueOf(map.getOrDefault("content", ""));
         ChatMessage message = new ChatMessage(roomId, username, content);
-        boolean sent = server.sendMessage(roomId, message, this);
+        boolean sent = server.sendMessage(roomId, message);
 
         Map<String, Object> response = new HashMap<>();
         response.put("status", sent ? "success" : "error");
@@ -225,14 +226,22 @@ public class ClientHandler implements Runnable {
             return;
         }
         String roomId = String.valueOf(request.get("roomId"));
-        String fileName = String.valueOf(request.get("fileName"));
+        String fileName = request.get("fileName") instanceof String value ? value : "";
         Object requestedFileData = request.get("fileData");
-        if (!(requestedFileData instanceof byte[] fileData) || fileData.length > 5 * 1024 * 1024) {
+        if (fileName.isBlank() || fileName.length() > 255
+                || !(requestedFileData instanceof byte[] fileData) || fileData.length > 5 * 1024 * 1024) {
             sendError("File must be a byte array no larger than 5 MB");
             return;
         }
-        ChatMessage message = new ChatMessage(roomId, username, "[FILE] " + fileName, fileName, fileData);
-        boolean sent = server.sendMessage(roomId, message, this);
+        String safeFileName = fileName.replace('\\', '/');
+        safeFileName = safeFileName.substring(safeFileName.lastIndexOf('/') + 1);
+        if (safeFileName.isBlank() || ".".equals(safeFileName) || "..".equals(safeFileName)) {
+            sendError("Invalid attachment file name");
+            return;
+        }
+        ChatMessage message = new ChatMessage(roomId, username, "[FILE] " + safeFileName,
+                safeFileName, fileData);
+        boolean sent = server.sendMessage(roomId, message);
 
         Map<String, Object> response = new HashMap<>();
         response.put("status", sent ? "success" : "error");
@@ -255,6 +264,19 @@ public class ClientHandler implements Runnable {
         response.put("status", "success");
         response.put("history", history);
         send(response);
+    }
+
+    private void handleMarkRead(Map<?, ?> request) throws SQLException {
+        if (username == null) {
+            sendError("Please login first");
+            return;
+        }
+        String roomId = request.get("roomId") instanceof String value ? value : "";
+        Object requestedMessageId = request.get("messageId");
+        if (!(requestedMessageId instanceof Number messageId)
+                || !server.markMessageRead(roomId, messageId.longValue(), username)) {
+            sendError("Message was not found in the room or access was denied");
+        }
     }
 
     private void sendError(String message) {

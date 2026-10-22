@@ -87,7 +87,7 @@ public final class DatabaseStore {
             connection.setAutoCommit(false);
             try (PreparedStatement roomStatement = connection.prepareStatement(roomSql);
                  PreparedStatement memberStatement = connection.prepareStatement(memberSql);
-                 PreparedStatement messageStatement = connection.prepareStatement(messageSql)) {
+                 PreparedStatement messageStatement = connection.prepareStatement(messageSql, Statement.RETURN_GENERATED_KEYS)) {
                 long now = System.currentTimeMillis();
                 roomStatement.setString(1, room.getRoomId());
                 roomStatement.setString(2, room.getRoomName());
@@ -106,9 +106,16 @@ public final class DatabaseStore {
 
                 for (ChatMessage message : room.getHistory()) {
                     setMessage(messageStatement, message);
-                    messageStatement.addBatch();
+                    messageStatement.executeUpdate();
+                    try (ResultSet keys = messageStatement.getGeneratedKeys()) {
+                        if (!keys.next()) {
+                            throw new SQLException("Could not retrieve the ID for a sample message.");
+                        }
+                        message.setMessageId(keys.getLong(1));
+                    }
+                    message.addReader(message.getSender());
+                    insertReadReceipt(connection, message.getMessageId(), message.getSender());
                 }
-                messageStatement.executeBatch();
                 connection.commit();
             } catch (SQLException e) {
                 rollback(connection, e);
@@ -133,10 +140,44 @@ public final class DatabaseStore {
         String sql = "INSERT INTO messages "
                 + "(room_id, sender_username, content, file_name, file_data, created_at) "
                 + "VALUES (?, ?, ?, ?, ?, ?)";
-        try (Connection connection = connect();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
-            setMessage(statement, message);
-            statement.executeUpdate();
+        try (Connection connection = connect()) {
+            connection.setAutoCommit(false);
+            try (PreparedStatement statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
+                setMessage(statement, message);
+                statement.executeUpdate();
+                try (ResultSet keys = statement.getGeneratedKeys()) {
+                    if (!keys.next()) {
+                        throw new SQLException("Could not retrieve the ID for the saved message.");
+                    }
+                    message.setMessageId(keys.getLong(1));
+                }
+                message.addReader(message.getSender());
+                insertReadReceipt(connection, message.getMessageId(), message.getSender());
+                connection.commit();
+            } catch (SQLException e) {
+                rollback(connection, e);
+                throw e;
+            }
+        }
+    }
+
+    public List<String> markMessageRead(long messageId, String roomId, String username) throws SQLException {
+        String verifySql = "SELECT 1 FROM messages m "
+                + "JOIN room_members rm ON rm.room_id = m.room_id AND rm.username = ? "
+                + "WHERE m.message_id = ? AND m.room_id = ?";
+        try (Connection connection = connect()) {
+            try (PreparedStatement verify = connection.prepareStatement(verifySql)) {
+                verify.setString(1, username);
+                verify.setLong(2, messageId);
+                verify.setString(3, roomId);
+                try (ResultSet result = verify.executeQuery()) {
+                    if (!result.next()) {
+                        throw new SQLException("Message does not exist in this room or user is not a member.");
+                    }
+                }
+            }
+            insertReadReceipt(connection, messageId, username);
+            return loadReaders(connection, messageId);
         }
     }
 
@@ -195,6 +236,21 @@ public final class DatabaseStore {
                         FOREIGN KEY (sender_username) REFERENCES users (username)
                         ON UPDATE CASCADE ON DELETE RESTRICT
                 ) ENGINE = InnoDB
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS message_read_receipts (
+                    message_id BIGINT NOT NULL,
+                    username VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+                    read_at BIGINT NOT NULL,
+                    PRIMARY KEY (message_id, username),
+                    KEY idx_message_read_receipts_username (username),
+                    CONSTRAINT fk_message_read_receipts_message
+                        FOREIGN KEY (message_id) REFERENCES messages (message_id)
+                        ON UPDATE CASCADE ON DELETE CASCADE,
+                    CONSTRAINT fk_message_read_receipts_user
+                        FOREIGN KEY (username) REFERENCES users (username)
+                        ON UPDATE CASCADE ON DELETE CASCADE
+                ) ENGINE = InnoDB
                 """
         );
         try (Connection connection = connect(); Statement statement = connection.createStatement()) {
@@ -218,22 +274,62 @@ public final class DatabaseStore {
     }
 
     private void loadRoomMessages(ChatRoom room) throws SQLException {
-        String sql = "SELECT sender_username, content, file_name, file_data, created_at "
-                + "FROM messages WHERE room_id = ? ORDER BY message_id";
+        String sql = "SELECT m.message_id, m.sender_username, m.content, m.file_name, m.file_data, m.created_at, "
+                + "r.username AS reader_username FROM messages m "
+                + "LEFT JOIN message_read_receipts r ON r.message_id = m.message_id "
+                + "WHERE m.room_id = ? ORDER BY m.message_id, r.username";
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, room.getRoomId());
             try (ResultSet rows = statement.executeQuery()) {
+                ChatMessage current = null;
+                long currentId = -1;
                 while (rows.next()) {
-                    room.addMessage(new ChatMessage(room.getRoomId(),
-                            rows.getString("sender_username"),
-                            rows.getString("content"),
-                            rows.getString("file_name"),
-                            rows.getBytes("file_data"),
-                            rows.getLong("created_at")));
+                    long messageId = rows.getLong("message_id");
+                    if (current == null || currentId != messageId) {
+                        if (current != null) {
+                            room.addMessage(current);
+                        }
+                        currentId = messageId;
+                        current = new ChatMessage(room.getRoomId(),
+                                rows.getString("sender_username"),
+                                rows.getString("content"),
+                                rows.getString("file_name"),
+                                rows.getBytes("file_data"),
+                                rows.getLong("created_at"),
+                                messageId);
+                    }
+                    current.addReader(rows.getString("reader_username"));
+                }
+                if (current != null) {
+                    room.addMessage(current);
                 }
             }
         }
+    }
+
+    private void insertReadReceipt(Connection connection, long messageId, String username) throws SQLException {
+        String sql = "INSERT IGNORE INTO message_read_receipts (message_id, username, read_at) VALUES (?, ?, ?)";
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, messageId);
+            statement.setString(2, username);
+            statement.setLong(3, System.currentTimeMillis());
+            statement.executeUpdate();
+        }
+    }
+
+    private List<String> loadReaders(Connection connection, long messageId) throws SQLException {
+        String sql = "SELECT username FROM message_read_receipts WHERE message_id = ? ORDER BY read_at, username";
+        List<String> readers = new ArrayList<>();
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setLong(1, messageId);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    readers.add(rows.getString("username"));
+                }
+            }
+        }
+        return readers;
     }
 
     private void setMessage(PreparedStatement statement, ChatMessage message) throws SQLException {

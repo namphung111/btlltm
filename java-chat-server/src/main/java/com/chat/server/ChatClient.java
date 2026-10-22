@@ -4,6 +4,7 @@ import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
+import javax.swing.JComponent;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -14,6 +15,10 @@ import javax.swing.JScrollPane;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
+import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.stream.ImageInputStream;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Component;
@@ -23,9 +28,12 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
+import java.awt.Image;
 import java.awt.Insets;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
@@ -39,12 +47,14 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 
 public final class ChatClient {
     private static final int CONNECT_TIMEOUT_MS = 5_000;
     private static final long MAX_FILE_SIZE = 5L * 1024 * 1024;
+    private static final long MAX_IMAGE_PIXELS = 20_000_000L;
     private static final DateTimeFormatter TIME_FORMAT =
             DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
     private static final Color BRAND_BLUE = new Color(0, 104, 224);
@@ -61,13 +71,14 @@ public final class ChatClient {
     private final JLabel roomSubtitleLabel = new JLabel("Tạo phòng mới hoặc tham gia bằng ID");
     private final JPanel roomListPanel = new JPanel();
     private final JPanel onlineUsersPanel = new JPanel();
+    private final Map<Long, JLabel> readStatusLabels = new HashMap<>();
 
     private Socket socket;
     private ObjectOutputStream out;
     private ObjectInputStream in;
     private volatile String username;
-    private String activeRoomId;
-    private String activeRoomName;
+    private volatile String activeRoomId;
+    private volatile String activeRoomName;
     private volatile String pendingAuthenticationAction;
     private volatile boolean logoutPending;
     private volatile boolean closeAfterLogout;
@@ -229,8 +240,20 @@ public final class ChatClient {
         }
         if ("newMessage".equals(eventAction)) {
             Object message = response.get("message");
-            if (message instanceof ChatMessage chatMessage) {
+            String roomId = String.valueOf(response.get("roomId"));
+            if (message instanceof ChatMessage chatMessage && roomId.equals(activeRoomId)) {
                 displayMessage(chatMessage);
+                if (!username.equals(chatMessage.getSender()) && chatMessage.getMessageId() > 0) {
+                    requestMessageRead(chatMessage);
+                }
+            }
+            return;
+        }
+        if ("messageRead".equals(eventAction)) {
+            Object messageId = response.get("messageId");
+            Object readers = response.get("readBy");
+            if (messageId instanceof Number id && readers instanceof List<?> readBy) {
+                SwingUtilities.invokeLater(() -> updateReadReceiptOnEdt(id.longValue(), readBy));
             }
             return;
         }
@@ -293,9 +316,13 @@ public final class ChatClient {
         if ("success".equals(status) && response.get("history") instanceof List<?> history) {
             SwingUtilities.invokeLater(() -> {
                 messageList.removeAll();
+                readStatusLabels.clear();
                 for (Object item : history) {
                     if (item instanceof ChatMessage chatMessage) {
                         appendMessageOnEdt(chatMessage);
+                        if (!username.equals(chatMessage.getSender()) && chatMessage.getMessageId() > 0) {
+                            requestMessageRead(chatMessage);
+                        }
                     }
                 }
                 messageList.revalidate();
@@ -545,8 +572,8 @@ public final class ChatClient {
         toolbar.add(imageButton);
         toolbar.add(fileButton);
         toolbar.add(roomIdButton);
-        fileButton.addActionListener(event -> sendFile());
-        imageButton.addActionListener(event -> sendFile());
+        fileButton.addActionListener(event -> sendFile(false));
+        imageButton.addActionListener(event -> sendFile(true));
         roomIdButton.addActionListener(event -> copyRoomId());
         composer.add(toolbar, BorderLayout.NORTH);
 
@@ -737,20 +764,22 @@ public final class ChatClient {
             bubble.add(Box.createVerticalStrut(3));
         }
 
-        String content = message.getFileName() == null
-                ? message.getContent() : "Tệp đính kèm: " + message.getFileName();
-        JTextArea text = new JTextArea(content == null ? "" : content);
-        text.setColumns(36);
-        text.setRows(Math.max(1, Math.min(8, (content == null ? 0 : content.length() + 35) / 36)));
-        text.setEditable(false);
-        text.setLineWrap(true);
-        text.setWrapStyleWord(true);
-        text.setOpaque(false);
-        text.setForeground(TEXT_COLOR);
-        text.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
-        text.setAlignmentX(Component.LEFT_ALIGNMENT);
-        text.setMaximumSize(new Dimension(430, Integer.MAX_VALUE));
-        bubble.add(text);
+        if (message.getFileName() != null && message.getFileData() != null) {
+            bubble.add(createAttachmentView(message));
+        } else {
+            JTextArea text = new JTextArea(message.getContent() == null ? "" : message.getContent());
+            text.setColumns(36);
+            text.setRows(Math.max(1, Math.min(8, (text.getText().length() + 35) / 36)));
+            text.setEditable(false);
+            text.setLineWrap(true);
+            text.setWrapStyleWord(true);
+            text.setOpaque(false);
+            text.setForeground(TEXT_COLOR);
+            text.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 14));
+            text.setAlignmentX(Component.LEFT_ALIGNMENT);
+            text.setMaximumSize(new Dimension(430, Integer.MAX_VALUE));
+            bubble.add(text);
+        }
 
         JLabel time = new JLabel(TIME_FORMAT.format(Instant.ofEpochMilli(message.getTimestamp())));
         time.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
@@ -758,6 +787,16 @@ public final class ChatClient {
         time.setAlignmentX(Component.LEFT_ALIGNMENT);
         bubble.add(Box.createVerticalStrut(4));
         bubble.add(time);
+        if (ownMessage && message.getMessageId() > 0) {
+            JLabel readStatus = new JLabel();
+            readStatus.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 10));
+            readStatus.setForeground(BRAND_BLUE);
+            readStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
+            bubble.add(Box.createVerticalStrut(2));
+            bubble.add(readStatus);
+            readStatusLabels.put(message.getMessageId(), readStatus);
+            updateReadReceiptOnEdt(message.getMessageId(), new ArrayList<>(message.getReadBy()));
+        }
         row.add(bubble, ownMessage ? BorderLayout.EAST : BorderLayout.WEST);
         row.setAlignmentX(Component.LEFT_ALIGNMENT);
         messageList.add(row);
@@ -804,59 +843,186 @@ public final class ChatClient {
         request.put("roomId", activeRoomId);
         request.put("content", content);
         send(request);
-        appendMessage(new ChatMessage(activeRoomId, username, content));
         messageField.setText("");
     }
 
-    private void sendFile() {
+    private void sendFile(boolean imageOnly) {
         if (activeRoomId == null) {
             showError("Tạo hoặc tham gia phòng chat trước khi gửi file.");
             return;
         }
         JFileChooser chooser = new JFileChooser();
+        if (imageOnly) {
+            chooser.setDialogTitle("Chọn ảnh để gửi");
+            chooser.setFileFilter(new FileNameExtensionFilter(
+                    "Ảnh (PNG, JPEG, GIF, BMP)", "png", "jpg", "jpeg", "gif", "bmp"));
+        }
         if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
             return;
         }
         Path path = chooser.getSelectedFile().toPath();
         try {
+            if (imageOnly && !isImageFile(path.getFileName().toString())) {
+                showError("Chỉ hỗ trợ ảnh PNG, JPEG, GIF hoặc BMP.");
+                return;
+            }
             long size = Files.size(path);
             if (size > MAX_FILE_SIZE) {
                 showError("File vượt giới hạn 5 MB.");
                 return;
             }
             byte[] fileData = Files.readAllBytes(path);
+            if (imageOnly && readImage(fileData) == null) {
+                showError("Không đọc được dữ liệu ảnh đã chọn.");
+                return;
+            }
             Map<String, Object> request = actionRequest("sendFile");
             request.put("roomId", activeRoomId);
             request.put("fileName", path.getFileName().toString());
             request.put("fileData", fileData);
             send(request);
-            appendMessage(new ChatMessage(activeRoomId, username, "[FILE] " + path.getFileName(),
-                    path.getFileName().toString(), fileData));
         } catch (IOException e) {
             showError("Không đọc được file: " + e.getMessage());
         }
     }
 
+    private JComponent createAttachmentView(ChatMessage message) {
+        JPanel attachment = new JPanel();
+        attachment.setOpaque(false);
+        attachment.setLayout(new BoxLayout(attachment, BoxLayout.Y_AXIS));
+        attachment.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        if (isImageFile(message.getFileName())) {
+            try {
+                BufferedImage image = readImage(message.getFileData());
+                if (image != null) {
+                    double scale = Math.min(1.0, Math.min(280.0 / image.getWidth(), 200.0 / image.getHeight()));
+                    Image thumbnail = image.getScaledInstance(
+                            Math.max(1, (int) (image.getWidth() * scale)),
+                            Math.max(1, (int) (image.getHeight() * scale)), Image.SCALE_SMOOTH);
+                    JButton preview = new JButton(new javax.swing.ImageIcon(thumbnail));
+                    preview.setToolTipText("Mở ảnh lớn");
+                    preview.setAlignmentX(Component.LEFT_ALIGNMENT);
+                    preview.setBorder(BorderFactory.createLineBorder(new Color(220, 225, 232)));
+                    preview.setContentAreaFilled(false);
+                    preview.addActionListener(event -> showImagePreview(message));
+                    attachment.add(preview);
+                }
+            } catch (IOException e) {
+                showError("Không xem trước được ảnh " + message.getFileName() + ": " + e.getMessage());
+            }
+        }
+
+        JLabel fileName = new JLabel(message.getFileName());
+        fileName.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
+        fileName.setForeground(TEXT_COLOR);
+        fileName.setAlignmentX(Component.LEFT_ALIGNMENT);
+        attachment.add(Box.createVerticalStrut(4));
+        attachment.add(fileName);
+
+        JButton download = new JButton("Tải xuống");
+        download.setToolTipText("Lưu tệp đính kèm vào máy");
+        download.setAlignmentX(Component.LEFT_ALIGNMENT);
+        download.setMargin(new Insets(3, 8, 3, 8));
+        download.addActionListener(event -> downloadAttachment(message));
+        attachment.add(Box.createVerticalStrut(4));
+        attachment.add(download);
+        return attachment;
+    }
+
+    private boolean isImageFile(String fileName) {
+        int extensionIndex = fileName.lastIndexOf('.');
+        if (extensionIndex < 0 || extensionIndex == fileName.length() - 1) {
+            return false;
+        }
+        String extension = fileName.substring(extensionIndex + 1).toLowerCase();
+        return List.of("png", "jpg", "jpeg", "gif", "bmp").contains(extension);
+    }
+
+    private BufferedImage readImage(byte[] imageData) throws IOException {
+        try (ImageInputStream input = ImageIO.createImageInputStream(new ByteArrayInputStream(imageData))) {
+            if (input == null) {
+                return null;
+            }
+            Iterator<ImageReader> readers = ImageIO.getImageReaders(input);
+            if (!readers.hasNext()) {
+                return null;
+            }
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(input, true, true);
+                int width = reader.getWidth(0);
+                int height = reader.getHeight(0);
+                if (width <= 0 || height <= 0 || (long) width * height > MAX_IMAGE_PIXELS) {
+                    throw new IOException("Ảnh vượt giới hạn 20 megapixel.");
+                }
+                return reader.read(0);
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    private void showImagePreview(ChatMessage message) {
+        try {
+            BufferedImage image = readImage(message.getFileData());
+            if (image == null) {
+                showError("Định dạng ảnh không được hỗ trợ.");
+                return;
+            }
+            Dimension screen = java.awt.Toolkit.getDefaultToolkit().getScreenSize();
+            double scale = Math.min(1.0, Math.min((screen.width - 160.0) / image.getWidth(),
+                    (screen.height - 180.0) / image.getHeight()));
+            Image scaled = image.getScaledInstance(
+                    Math.max(1, (int) (image.getWidth() * scale)),
+                    Math.max(1, (int) (image.getHeight() * scale)), Image.SCALE_SMOOTH);
+            JLabel imageLabel = new JLabel(new javax.swing.ImageIcon(scaled));
+            JScrollPane scrollPane = new JScrollPane(imageLabel);
+            scrollPane.setPreferredSize(new Dimension(
+                    Math.min(screen.width - 100, Math.max(320, (int) (image.getWidth() * scale))),
+                    Math.min(screen.height - 140, Math.max(240, (int) (image.getHeight() * scale)))));
+            JOptionPane.showMessageDialog(frame, scrollPane, message.getFileName(),
+                    JOptionPane.PLAIN_MESSAGE);
+        } catch (IOException e) {
+            showError("Không mở được ảnh: " + e.getMessage());
+        }
+    }
+
+    private void downloadAttachment(ChatMessage message) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setSelectedFile(Path.of(message.getFileName()).getFileName().toFile());
+        if (chooser.showSaveDialog(frame) == JFileChooser.APPROVE_OPTION) {
+            try {
+                Files.write(chooser.getSelectedFile().toPath(), message.getFileData());
+                showInfo("Đã lưu tệp: " + chooser.getSelectedFile().getName());
+            } catch (IOException e) {
+                showError("Không lưu được file: " + e.getMessage());
+            }
+        }
+    }
+
+    private void requestMessageRead(ChatMessage message) {
+        Map<String, Object> request = actionRequest("markRead");
+        request.put("roomId", message.getRoomId());
+        request.put("messageId", message.getMessageId());
+        send(request);
+    }
+
+    private void updateReadReceiptOnEdt(long messageId, List<?> readers) {
+        JLabel status = readStatusLabels.get(messageId);
+        if (status == null) {
+            return;
+        }
+        List<String> otherReaders = readers.stream()
+                .map(String::valueOf)
+                .filter(reader -> !reader.equals(username))
+                .toList();
+        status.setText(otherReaders.isEmpty()
+                ? "Đã gửi" : "Đã xem bởi: " + String.join(", ", otherReaders));
+    }
+
     private void displayMessage(ChatMessage message) {
         appendMessage(message);
-        if (message.getFileData() != null && message.getFileName() != null) {
-            SwingUtilities.invokeLater(() -> {
-                int choice = JOptionPane.showConfirmDialog(frame,
-                        "Lưu file \"" + message.getFileName() + "\" từ " + message.getSender() + "?",
-                        "Nhận file", JOptionPane.YES_NO_OPTION);
-                if (choice == JOptionPane.YES_OPTION) {
-                    JFileChooser chooser = new JFileChooser();
-                    chooser.setSelectedFile(Path.of(message.getFileName()).getFileName().toFile());
-                    if (chooser.showSaveDialog(frame) == JFileChooser.APPROVE_OPTION) {
-                        try {
-                            Files.write(chooser.getSelectedFile().toPath(), message.getFileData());
-                        } catch (IOException e) {
-                            showError("Không lưu được file: " + e.getMessage());
-                        }
-                    }
-                }
-            });
-        }
     }
 
     private void send(Map<String, Object> request) {

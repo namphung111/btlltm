@@ -1,5 +1,7 @@
 # Realtime Chat (Java Socket + MySQL)
 
+> Đây là phiên bản TCP/Swing cũ. Phiên bản hiện hành dùng server Spring Boot/WebSocket, PostgreSQL và client JavaFX: xem [chat-platform](../chat-platform/README.md).
+
 Ứng dụng chat desktop Swing theo mô hình client–server. Client kết nối TCP tới server; MySQL lưu tài khoản, phòng chat, thành viên phòng, tin nhắn và dữ liệu file. Danh sách online được giữ trong bộ nhớ khi server đang chạy.
 
 ## Yêu cầu
@@ -19,6 +21,7 @@ File schema: [`database/schema.sql`](./database/schema.sql). Schema tạo databa
 | `rooms` | Thông tin phòng và người tạo | Liên kết tới `users` qua `created_by` |
 | `room_members` | Danh sách thành viên phòng | Bảng liên kết nhiều-nhiều giữa `rooms` và `users` |
 | `messages` | Tin nhắn, thời gian, file đính kèm | Liên kết tới phòng và người gửi; file lưu dưới dạng BLOB |
+| `message_read_receipts` | Người đã đọc từng tin nhắn và thời điểm đọc | Liên kết nhiều-nhiều giữa tin nhắn và người dùng |
 
 Các khóa ngoại giữ dữ liệu thành viên và tin nhắn nhất quán; chỉ mục trên thành viên và lịch sử tin nhắn hỗ trợ truy vấn theo phòng. Username được so sánh phân biệt chữ hoa/thường. Ứng dụng tự tạo các bảng còn thiếu khi khởi động; database phải được tạo trước.
 
@@ -108,8 +111,9 @@ Trong cửa sổ client:
 
 1. Chọn **Đăng ký** để tạo tài khoản hoặc dùng tài khoản demo.
 2. Tạo phòng mới hoặc nhập ID phòng được chia sẻ để tham gia.
-3. Gửi tin nhắn hoặc file (tối đa 5 MB); người nhận có thể chọn nơi lưu file.
-4. Chọn **Đăng xuất** khi kết thúc phiên.
+3. Dùng nút ảnh để gửi PNG/JPEG/GIF/BMP (tối đa 5 MB, tối đa 20 megapixel); ảnh hiện xem trước ngay trong hội thoại, nhấn ảnh để mở lớn.
+4. File khác và ảnh đều có nút **Tải xuống** trong tin nhắn. Tệp nhận được không tự lưu vào máy.
+5. Khi thành viên mở phòng hoặc đang xem lúc có tin nhắn mới, người gửi thấy trạng thái **Đã xem bởi** cùng tên những người đã đọc. Việc xem được ghi lại trong `message_read_receipts`.
 
 ## Dữ liệu demo
 
@@ -132,7 +136,9 @@ Không dùng tài khoản/mật khẩu demo trong môi trường thực tế.
 
 ## Lưu trữ và giới hạn
 
-- Tài khoản, phòng, thành viên, lịch sử tin nhắn và file được lưu trong MySQL, nên vẫn còn sau khi server khởi động lại.
+- Tài khoản, phòng, thành viên, lịch sử tin nhắn, file và trạng thái đã đọc được lưu trong MySQL, nên vẫn còn sau khi server khởi động lại.
+- Bảng `message_read_receipts` được server tự tạo khi khởi động để cập nhật database cũ; file `database/schema.sql` cũng tạo sẵn bảng này khi import mới.
+- Cần khởi động lại server sau khi cập nhật ứng dụng để server tạo bảng trạng thái đã xem nếu database được tạo từ phiên bản cũ.
 - Trạng thái online chỉ có ý nghĩa trong phiên chạy hiện tại của server.
 - Mật khẩu hiện được băm SHA-256 theo cách của ứng dụng demo; trước khi triển khai thực tế cần thay bằng thuật toán chuyên dụng có salt như Argon2id hoặc bcrypt.
 - Giao thức là Java `ObjectStream` trên TCP, không phải HTTP. Đây là ứng dụng bài tập/demo: không mở port ra Internet công cộng; cần bổ sung TLS, hardening xác thực và kiểm tra đầu vào trước khi triển khai thực tế.
