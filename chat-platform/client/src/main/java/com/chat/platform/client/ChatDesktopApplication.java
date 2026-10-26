@@ -42,6 +42,9 @@ import javafx.stage.Stage;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -66,6 +69,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class ChatDesktopApplication extends Application implements WebSocket.Listener {
+    private static final int DISCOVERY_PORT = 39555;
+    private static final String DISCOVERY_REQUEST = "CHAT_PLATFORM_DISCOVER";
+    private static final String DISCOVERY_RESPONSE_PREFIX = "CHAT_PLATFORM_SERVER|";
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final DateTimeFormatter TIME_FORMAT =
             DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
@@ -174,6 +180,54 @@ public final class ChatDesktopApplication extends Application implements WebSock
         applyStyles(scene);
         stage.setScene(scene);
         stage.show();
+        discoverLanServer(serverField, message, loginButton, registerButton);
+    }
+
+    private void discoverLanServer(TextField serverField, Label status,
+                                   Button loginButton, Button registerButton) {
+        serverField.setText("Đang tìm server trong mạng LAN...");
+        loginButton.setDisable(true);
+        registerButton.setDisable(true);
+        requests.execute(() -> {
+            String discoveredUrl = null;
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.setBroadcast(true);
+                socket.setSoTimeout(1200);
+                byte[] requestBytes = DISCOVERY_REQUEST.getBytes(StandardCharsets.UTF_8);
+                InetAddress broadcast = InetAddress.getByName("255.255.255.255");
+                for (int attempt = 0; attempt < 3 && discoveredUrl == null; attempt++) {
+                    socket.send(new DatagramPacket(requestBytes, requestBytes.length,
+                            broadcast, DISCOVERY_PORT));
+                    try {
+                        byte[] responseBytes = new byte[128];
+                        DatagramPacket response = new DatagramPacket(responseBytes, responseBytes.length);
+                        socket.receive(response);
+                        String payload = new String(response.getData(), response.getOffset(),
+                                response.getLength(), StandardCharsets.UTF_8);
+                        if (payload.startsWith(DISCOVERY_RESPONSE_PREFIX)) {
+                            String port = payload.substring(DISCOVERY_RESPONSE_PREFIX.length()).trim();
+                            discoveredUrl = "http://" + response.getAddress().getHostAddress() + ":" + port;
+                        }
+                    } catch (java.net.SocketTimeoutException ignored) {
+                        // Try the next broadcast. The server may be on another network adapter.
+                    }
+                }
+            } catch (IOException ignored) {
+                // Manual server URL entry remains available if LAN discovery is unavailable.
+            }
+            String result = discoveredUrl;
+            Platform.runLater(() -> {
+                if (result != null) {
+                    serverField.setText(result);
+                    status.setText("Đã tìm thấy server trong mạng LAN.");
+                } else {
+                    serverField.setText("http://localhost:8080");
+                    status.setText("Không tự tìm thấy server; hãy nhập URL server nếu cần.");
+                }
+                loginButton.setDisable(false);
+                registerButton.setDisable(false);
+            });
+        });
     }
 
     private void authenticate(TextField serverField, TextField usernameField,
@@ -193,7 +247,9 @@ public final class ChatDesktopApplication extends Application implements WebSock
             status.setText("URL server không hợp lệ.");
             return;
         }
-        if ("http".equalsIgnoreCase(serverUri.getScheme()) && !isLocalHost(serverUri.getHost())) {
+        if ("http".equalsIgnoreCase(serverUri.getScheme())
+                && !isLocalHost(serverUri.getHost())
+                && !isPrivateNetwork(serverUri.getHost())) {
             status.setText("Server ngoài máy này phải dùng HTTPS để bảo vệ mật khẩu và token.");
             return;
         }
@@ -1508,6 +1564,14 @@ public final class ChatDesktopApplication extends Application implements WebSock
                 || "127.0.0.1".equals(host)
                 || "::1".equals(host)
                 || "[::1]".equals(host);
+    }
+
+    private boolean isPrivateNetwork(String host) {
+        try {
+            return InetAddress.getByName(host).isSiteLocalAddress();
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private String readText(Message message) {
