@@ -551,11 +551,12 @@ public final class ChatDesktopApplication extends Application implements WebSock
         HBox actions = new HBox(8, change, logout, close);
         VBox content = new VBox(12, avatarView(username), user, actions);
         content.setPadding(new Insets(8));
-        Alert profile = new Alert(Alert.AlertType.NONE);
+        Dialog<ButtonType> profile = new Dialog<>();
         profile.setTitle("Thông tin người dùng");
         profile.setHeaderText("Tài khoản của bạn");
+        profile.initOwner(stage);
         profile.getDialogPane().setContent(content);
-        profile.getDialogPane().getButtonTypes().setAll();
+        profile.getDialogPane().getButtonTypes().setAll(ButtonType.CLOSE);
         change.setOnAction(event -> { profile.close(); changeAvatar(); });
         logout.setOnAction(event -> { profile.close(); logout(); });
         close.setOnAction(event -> profile.close());
