@@ -106,6 +106,7 @@ public final class ChatDesktopApplication extends Application implements WebSock
 
     private Stage stage;
     private String baseUrl;
+    private volatile String discoveredLanHost;
     private String username;
     private String token;
     private String activeRoomId;
@@ -130,7 +131,7 @@ public final class ChatDesktopApplication extends Application implements WebSock
     }
 
     private void showLogin() {
-        TextField serverField = new TextField("http://localhost:8080");
+        TextField serverField = new TextField("https://chat-server-cif5.onrender.com/");
         TextField usernameField = new TextField();
         PasswordField passwordField = new PasswordField();
         serverField.setPromptText("Server URL, ví dụ https://chat.example.com");
@@ -206,7 +207,8 @@ public final class ChatDesktopApplication extends Application implements WebSock
                                 response.getLength(), StandardCharsets.UTF_8);
                         if (payload.startsWith(DISCOVERY_RESPONSE_PREFIX)) {
                             String port = payload.substring(DISCOVERY_RESPONSE_PREFIX.length()).trim();
-                            discoveredUrl = "http://" + response.getAddress().getHostAddress() + ":" + port;
+                            discoveredLanHost = response.getAddress().getHostAddress();
+                            discoveredUrl = "http://" + discoveredLanHost + ":" + port;
                         }
                     } catch (java.net.SocketTimeoutException ignored) {
                         // Try the next broadcast. The server may be on another network adapter.
@@ -221,7 +223,7 @@ public final class ChatDesktopApplication extends Application implements WebSock
                     serverField.setText(result);
                     status.setText("Đã tìm thấy server trong mạng LAN.");
                 } else {
-                    serverField.setText("http://localhost:8080");
+                    serverField.setText("https://chat-server-cif5.onrender.com/");
                     status.setText("Không tự tìm thấy server; hãy nhập URL server nếu cần.");
                 }
                 loginButton.setDisable(false);
@@ -249,7 +251,8 @@ public final class ChatDesktopApplication extends Application implements WebSock
         }
         if ("http".equalsIgnoreCase(serverUri.getScheme())
                 && !isLocalHost(serverUri.getHost())
-                && !isPrivateNetwork(serverUri.getHost())) {
+                && !isPrivateNetwork(serverUri.getHost())
+                && !isDiscoveredLanHost(serverUri.getHost())) {
             status.setText("Server ngoài máy này phải dùng HTTPS để bảo vệ mật khẩu và token.");
             return;
         }
@@ -1572,6 +1575,10 @@ public final class ChatDesktopApplication extends Application implements WebSock
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private boolean isDiscoveredLanHost(String host) {
+        return host != null && host.equalsIgnoreCase(discoveredLanHost);
     }
 
     private String readText(Message message) {
